@@ -47,24 +47,24 @@ class ImageDataset(Dataset):
 
 class DIV2K(Dataset):
 
-    def __init__(self, root, train=True, distill=True, num_examples=None):
-        self.distill = distill
+    def __init__(self, root, mode="train", num_examples=None):
+        self.mode = mode
 
-        if train:
+        if mode == "train":
             self.lr = sorted(glob.glob(os.path.join(root, '*train_LR_bicubic/X4/*.png')))
-        else:
+        elif mode == "val":
             self.lr = sorted(glob.glob(os.path.join(root, '*valid_LR_bicubic/X4/*.png')))
-        
-        if not distill:
-            if train:
-                self.hr = sorted(glob.glob(os.path.join(root, '*train_HR/*.png')))
-            else:
-                self.hr = sorted(glob.glob(os.path.join(root, '*valid_HR/*.png')))
+        else:
+            self.lr = sorted(glob.glob(os.path.join(root, "*valid_LR/*.png")))
+
+        if mode == "train":
+            self.hr = sorted(glob.glob(os.path.join(root, '*train_HR/*.png')))
+        else:
+            self.hr = sorted(glob.glob(os.path.join(root, '*valid_HR/*.png')))
         
         if num_examples is not None:
             self.lr = self.lr[:num_examples]
-            if not distill:
-              self.hr = self.hr[:num_examples]
+            self.hr = self.hr[:num_examples]
         
     def __len__(self):
         return len(self.lr)
@@ -73,18 +73,15 @@ class DIV2K(Dataset):
         img_lr = cv2.imread(self.lr[idx % len(self.lr)], cv2.IMREAD_COLOR)
         img_lr = transform_to_torch(img_lr)
 
-        if not self.distill:
-            img_hr = cv2.imread(self.hr[idx % len(self.hr)], cv2.IMREAD_COLOR)
-            img_hr = transform_to_torch(img_hr)
+        img_hr = cv2.imread(self.hr[idx % len(self.hr)], cv2.IMREAD_COLOR)
+        img_hr = transform_to_torch(img_hr)
 
+        if self.mode != "test":
             img_lr, coords = transform_torch(img_lr)
             img_hr = crop_image(img_hr, coords[0]*4, coords[1]*4, coords[2]*4, coords[3]*4)
-            
 
-            return img_lr, img_hr
-        else:
-            crop, _ = transform_torch(img_lr)
-            return crop
+        return img_lr, img_hr
+
 
 
 

@@ -2,13 +2,22 @@ import numpy as np
 import cv2 
 import torch
 import torch.nn as nn
+import lpips
 
 from skimage.metrics import structural_similarity as ssim
 from skimage.measure import compare_ssim
+from pytorch_msssim import MS_SSIM
 
 def criterions(name):
-  if name == "mse":
-    return nn.MSELoss()
+    if name == "mse":
+        return nn.MSELoss()
+    elif name == "l1":
+        return nn.L1Loss()
+    elif name == "lpips":
+        return lpips.LPIPS(net="vgg").cuda()
+    elif name == "ms_ssim":
+        return MS_SSIM(data_range=1.0)
+
 
 def torch2image(tensor):
     result = tensor.cpu().squeeze().detach().float().clamp_(0, 1).numpy()
@@ -16,6 +25,7 @@ def torch2image(tensor):
     output = (output * 255.0).round().astype(np.uint8)
 
     return output
+
 
 def rgb2ycbcr(img, only_y=True):
     '''same as matlab rgb2ycbcr
@@ -40,8 +50,10 @@ def rgb2ycbcr(img, only_y=True):
         rlt /= 255.
     return rlt.astype(in_img_type)
 
+
 def calc_psnr(img, rec):
   return cv2.PSNR(rgb2ycbcr(img), rgb2ycbcr(rec))
+
 
 def calc_ssim(img, rec):
   img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)

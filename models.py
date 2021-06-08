@@ -1,3 +1,4 @@
+import os
 import functools
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,9 +7,12 @@ import torchvision
 import pytorch_lightning as pl
 import math
 import argparse
+import numpy as np
 
 from torchvision.models import vgg19
 from utils import criterions, calc_psnr, calc_ssim, torch2image
+from PIL import Image
+
 
 class FeatureExtractor(nn.Module):
     def __init__(self):
@@ -83,15 +87,21 @@ class RRDBNet(nn.Module):
         self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
     def forward(self, x):
+        embeds = []
         fea = self.conv_first(x)
-        trunk = self.trunk_conv(self.RRDB_trunk(fea))
+        embeds.append(fea)
+        out = fea
+        for block in self.RRDB_trunk:
+            out = block(out)
+            embeds.append(out)
+        trunk = self.trunk_conv(out)
         fea = fea + trunk
 
         fea = self.lrelu(self.upconv1(F.interpolate(fea, scale_factor=2, mode='nearest')))
         fea = self.lrelu(self.upconv2(F.interpolate(fea, scale_factor=2, mode='nearest')))
         out = self.conv_last(self.lrelu(self.HRconv(fea)))
 
-        return out
+        return out, embeds
 
 
 class RRDBKDNet(pl.LightningModule):
@@ -105,14 +115,21 @@ class RRDBKDNet(pl.LightningModule):
     self.hparams = hparams
     self.teacher_model = RRDBNet(hparams.in_nc, hparams.out_nc,
                          hparams.nf, hparams.nb, hparams.gc)
-    hparams.orig_checkpoint_path = '/content/drive/My Drive/RRDB_PSNR_x4.pth'
     self.teacher_model.load_state_dict(torch.load(hparams.orig_checkpoint_path))
     self.teacher_model.eval()
     
     self.student_model = RRDBNet(hparams.in_nc, hparams.out_nc,
                                  hparams.nf // hparams.nf_shrink, hparams.nb // hparams.nb_shrink,
                                  hparams.gc // hparams.gc_shrink)
-    self.criterion = criterions(hparams.criterion)
+    print(type(self.hparams.train_criterions))
+    self.train_criterions = [(criterions(criterion), weight, criterion) for criterion, weight in self.hparams.train_criterions.items()]
+    self.val_criterions = [(criterions(criterion), weight, criterion) for criterion, weight in self.hparams.val_criterions.items()]
+
+    if hparams.feature_matching is not None:
+        self.feature_matching, self.feature_matching_weight = hparams.feature_matching
+
+    if hparams.gt_criterions is not None:
+        self.gt_criterions = [(criterions(criterion), weight, criterion) for criterion, weight in self.hparams.gt_criterions.items()]
   
   def forward(self, x):
     return self.student_model(x)
@@ -123,50 +140,123 @@ class RRDBKDNet(pl.LightningModule):
   
   def training_step(self, batch, batch_idx):
     with torch.no_grad():
-      gt = self.teacher_model(batch)
-    predict = self.student_model(batch)
-    loss = self.criterion(predict, gt)
+      gt, features_gt = self.teacher_model(batch[0])
+    predict, features_pred = self.student_model(batch[0])
+
+    # loss_teaching = self.criterion(predict, gt)
+    loss = 0.0
+    for criterion, weight, name in self.train_criterions:
+        if name == "ms_ssim":
+            criterion_loss = criterion(gt.clamp_(0, 1), predict.clamp_(0, 1))
+            criterion_loss = 1 - criterion_loss
+        else:
+            criterion_loss = criterion(predict, gt)
+            if name == "lpips":
+                criterion_loss = torch.sum(criterion_loss)
+
+        loss += weight * criterion_loss
+        self.log(name, criterion_loss)
+
+    if self.feature_matching:
+        feature_matching_loss = 0.0
+        counter = 0
+        for i in range(1, len(features_pred) - 1):
+            if counter % self.hparams.nb_shrink:
+                feature_matching_loss += F.mse_loss(features_pred[i], features_gt[self.hparams.nb_shrink * i])
+            counter += 1
+        feature_matching_loss += F.mse_loss(features_pred[0], features_gt[0])
+        feature_matching_loss += F.mse_loss(features_pred[-1], features_gt[-1])
+
+        self.log("feature_mathing_loss", feature_matching_loss)
+        loss += self.feature_matching_weight * feature_matching_loss
+
+
+    if self.gt_criterions:
+        for criterion, weight, name in self.gt_criterions:
+            if name == "ms_ssim":
+                criterion_loss = criterion(batch[1].clamp_(0, 1), predict.clamp_(0, 1))
+                criterion_loss = 1 - criterion_loss
+            else:
+                criterion_loss = criterion(predict, batch[1])
+                if name == "lpips":
+                    criterion_loss = torch.sum(criterion_loss)
+
+            loss += weight * criterion_loss
+            self.log(name + "_gt", criterion_loss)
+
     self.log("train_batch_loss", loss)
     return {"loss": loss}
-  
-  # def training_epoch_end(self, outputs):
-  #   mean_loss = torch.mean(torch.sum(torch.stack([item['loss'] for item in outputs])))
-  #   self.log("train_epoch_mean_loss", loss)
-  
+
   def validation_step(self, batch, batch_idx):
-    gt = self.teacher_model(batch)
-    predict = self.student_model(batch)
-    loss = self.criterion(predict, gt)
-    # self.log("val_loss", loss)
-    return {'loss': loss, "gt": gt, "predict": predict}
+
+    predict, _ = self.student_model(batch[0])
+    gt = batch[1]
+
+    predict_numpy = torch2image(predict)[:, :, ::-1]
+    gt_numpy = torch2image(gt)[:, :, ::-1]
+    psnr = calc_psnr(predict_numpy, gt_numpy)
+    # loss = 0.0
+    # for criterion, weight, name in self.val_criterions:
+    #     criterion_loss = criterion(predict, gt)
+    #     loss += weight * criterion_loss
+    #     self.log(name, criterion_loss)
+
+    return {"origs": batch[0], 'psnr': psnr, "gt": batch[1], "predict": predict}
   
   def validation_epoch_end(self, outputs):
-    mean_loss = torch.mean(torch.stack([item['loss'] for item in outputs]))
-    self.log('val_loss', mean_loss.item())
+    mean_psnr = np.mean([item['psnr'] for item in outputs])
+    self.log('val_psnr', mean_psnr)
     logger = self.logger.experiment[0]
     teacher_images = torch.cat([item["gt"] for item in outputs[-4:]], dim=0)
     student_images = torch.cat([item["predict"] for item in outputs[-4:]], dim=0)
     viz_batch = torch.cat([teacher_images, student_images], dim=0)
     grid = torchvision.utils.make_grid(viz_batch)
-    grid = torch2image(grid)
+    grid = torch2image(grid)[:, :, ::-1]
     print(grid.shape)
-    logger.log_image(image_data=grid, name=self.current_epoch)
+    logger.log_image(image_data=grid, name=str(self.current_epoch) + "_hr")
+
+    lr_images = torch.cat([item["origs"] for item in outputs[-4:]], dim=0)
+    grid = torchvision.utils.make_grid(lr_images)
+    grid = torch2image(grid)[:, :, ::-1]
+    print(grid.shape)
+    logger.log_image(image_data=grid, name=str(self.current_epoch) + "_lr")
 
   def test_step(self, batch, batch_idx):
-    hr_pred = self.student_model(batch[0])
+    hr_pred, _ = self.student_model(batch[0])
+    hr_pred_teacher, _ = self.teacher_model(batch[0])
     hr_gt = batch[1]
 
-    hr_pred_numpy = torch2image(hr_pred)
-    hr_gt_numpy = torch2image(hr_gt)
-
-    print(hr_pred_numpy)
-    print(hr_gt_numpy)
+    lr_numpy = torch2image(batch[0])[:, :, ::-1]
+    hr_teacher_numpy = torch2image(hr_pred_teacher)[:, :, ::-1]
+    hr_pred_numpy = torch2image(hr_pred)[:, :, ::-1]
+    hr_gt_numpy = torch2image(hr_gt)[:, :, ::-1]
 
     psnr = calc_psnr(hr_gt_numpy, hr_pred_numpy)
     ssim = calc_ssim(hr_gt_numpy, hr_pred_numpy)
 
-    self.log_dict({"psnr": psnr, "ssim": ssim})
+    if not os.path.exists("./results/"):
+        os.makedirs("./results/")
 
+    try:
+        logger = self.logger.experiment[0]
+        name = logger.get_key()
+    except:
+        name = "tmp"
+
+    if not os.path.exists("./results/{}".format(name)):
+        os.makedirs("./results/{}".format(name))
+
+    lr_image = Image.fromarray(lr_numpy)
+    hr_teacher = Image.fromarray(hr_teacher_numpy)
+    img_pred = Image.fromarray(hr_pred_numpy)
+    gt_pred = Image.fromarray(hr_gt_numpy)
+
+    img_pred.save("./results/{}/{}_pred.png".format(name, str(batch_idx)), format="PNG")
+    hr_teacher.save("./results/{}/{}_teacher.png".format(name, str(batch_idx)), format="PNG")
+    gt_pred.save("./results/{}/{}_gt.png".format(name, str(batch_idx)), format="PNG")
+    lr_image.save("./results/{}/{}_lr.png".format(name, str(batch_idx)), format="PNG")
+
+    self.log_dict({"psnr": psnr, "ssim": ssim})
 
 
 class Discriminator(nn.Module):
